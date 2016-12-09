@@ -67,7 +67,10 @@ cert. Major SUBCOMMANDS are:
   register             Perform tasks related to registering with the CA
   rollback             Rollback server configuration changes made during install
   config_changes       Show changes made to server config during installation
+  update_symlinks      Update cert symlinks based on renewal config file
+  rename               Update a certificate's name
   plugins              Display information about installed plugins
+  certificates         Display information about certs configured with Certbot
 
 """.format(cli_command)
 
@@ -79,6 +82,7 @@ USAGE = SHORT_USAGE + """Choice of server plugins for obtaining and installing c
   --standalone      Run a standalone webserver for authentication
   %s
   --webroot         Place files in a server's webroot folder for authentication
+  --script          User provided shell scripts for authentication
 
 OR use different plugins to obtain (authenticate) the cert and then install it:
 
@@ -91,7 +95,7 @@ More detailed help:
 
    all, automation, paths, security, testing, or any of the subcommands or
    plugins (certonly, renew, install, register, nginx, apache, standalone,
-   webroot, etc.)
+   webroot, script, etc.)
 """
 
 
@@ -322,7 +326,8 @@ class HelpfulArgumentParser(object):
                       "install": main.install, "plugins": main.plugins_cmd,
                       "register": main.register, "renew": main.renew,
                       "revoke": main.revoke, "rollback": main.rollback,
-                      "everything": main.run}
+                      "everything": main.run, "update_symlinks": main.update_symlinks,
+                      "certificates": main.certificates, "rename": main.rename}
 
         # List of topics for which additional help can be provided
         HELP_TOPICS = ["all", "security", "paths", "automation", "testing"] + list(self.VERBS)
@@ -331,6 +336,7 @@ class HelpfulArgumentParser(object):
         self.help_topics = HELP_TOPICS + plugin_names + [None]
         usage, short_usage = usage_strings(plugins)
         self.parser = configargparse.ArgParser(
+            prog="certbot",
             usage=short_usage,
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
             args_for_setting_config_path=["-c", "--config"],
@@ -586,7 +592,8 @@ class HelpfulArgumentParser(object):
 
         """
         for name, plugin_ep in six.iteritems(plugins):
-            parser_or_group = self.add_group(name, description=plugin_ep.description)
+            parser_or_group = self.add_group(name,
+                                             description=plugin_ep.long_description)
             plugin_ep.plugin_cls.inject_parser_options(parser_or_group, name)
 
     def determine_help_topics(self, chosen_topic):
@@ -680,7 +687,19 @@ def prepare_and_parse_args(plugins, args, detect_defaults=False):  # pylint: dis
         help="Domain names to apply. For multiple domains you can use "
              "multiple -d flags or enter a comma separated list of domains "
              "as a parameter.")
-
+    helpful.add(
+        [None, "run", "certonly"],
+        "--cert-name", dest="certname",
+        metavar="CERTNAME", default=None,
+        help="Certificate name to apply. Only one certificate name can be used "
+             "per Certbot run. To see certificate names, run 'certbot certificates'."
+             "If there is no existing certificate with this name and "
+             "domains are requested, create a new certificate with this name.")
+    helpful.add(
+        "rename",
+        "--updated-cert-name", dest="new_certname",
+        metavar="NEW_CERTNAME", default=None,
+        help="New name for the certificate. Must be a valid filename.")
     helpful.add(
         [None, "testing", "renew", "certonly"],
         "--dry-run", action="store_true", dest="dry_run",
@@ -733,6 +752,12 @@ def prepare_and_parse_args(plugins, args, detect_defaults=False):  # pylint: dis
              "regardless of whether it is near expiry. (Often "
              "--keep-until-expiring is more appropriate). Also implies "
              "--expand.")
+    helpful.add(
+        "automation", "--renew-with-new-domains",
+        action="store_true", dest="renew_with_new_domains", help="If a "
+             "certificate already exists for the requested certificate name "
+             "but does not match the requested domains, renew it now, "
+             "regardless of whether it is near expiry.")
     helpful.add(
         ["automation", "renew", "certonly"],
         "--allow-subset-of-names", action="store_true",
@@ -901,10 +926,8 @@ def _create_subparsers(helpful):
              'Encrypt server, set this to "".')
     helpful.add("certonly",
                 "--csr", type=read_file,
-                help="Path to a Certificate Signing Request (CSR) in DER"
-                " format; note that the .csr file *must* contain a Subject"
-                " Alternative Name field for each domain you want certified."
-                " Currently --csr only works with the 'certonly' subcommand'")
+                help="Path to a Certificate Signing Request (CSR) in DER or PEM format."
+                " Currently --csr only works with the 'certonly' subcommand.")
     helpful.add("rollback",
                 "--checkpoints", type=int, metavar="N",
                 default=flag_default("rollback_checkpoints"),
@@ -991,6 +1014,8 @@ def _plugins_parsing(helpful, plugins):
                 help="Obtain and install certs using Nginx")
     helpful.add(["plugins", "certonly"], "--standalone", action="store_true",
                 help='Obtain certs using a "standalone" webserver.')
+    helpful.add(["plugins", "certonly"], "--script", action="store_true",
+                help='Obtain certs using shell script(s)')
     helpful.add(["plugins", "certonly"], "--manual", action="store_true",
                 help='Provide laborious manual instructions for obtaining a cert')
     helpful.add(["plugins", "certonly"], "--webroot", action="store_true",
@@ -1009,7 +1034,6 @@ class _DomainsAction(argparse.Action):
     def __call__(self, parser, namespace, domain, option_string=None):
         """Just wrap add_domains in argparseese."""
         add_domains(namespace, domain)
-
 
 def add_domains(args_or_config, domains):
     """Registers new domains to be used during the current client run.
